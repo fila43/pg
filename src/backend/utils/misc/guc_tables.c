@@ -461,6 +461,7 @@ static const struct config_enum_entry default_toast_compression_options[] = {
  */
 static const struct config_enum_entry temp_file_compression_options[] = {
 	{"no", TEMP_NONE_COMPRESSION, false},
+	{"pglz", TEMP_PGLZ_COMPRESSION, false},
 #ifdef  USE_LZ4
 	{"lz4", TEMP_LZ4_COMPRESSION, false},
 #endif

@@ -53,7 +53,9 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "utils/resowner.h"
+#include "utils/memutils.h"
 
+#include "common/pg_lzcompress.h"
 #ifdef USE_LZ4
 #include <lz4.h>
 #endif
@@ -108,6 +110,7 @@ struct BufFile
 	int			pos;			/* next read/write position in buffer */
 	int			nbytes;			/* total # of valid bytes in buffer */
 	bool			compress; /* State of usege file compression */
+    char        *cBuffer;
 	/*
 	 * XXX Should ideally us PGIOAlignedBlock, but might need a way to avoid
 	 * wasting per-file alignment padding when some users create many files.
@@ -140,6 +143,7 @@ makeBufFileCommon(int nfiles)
 	file->pos = 0;
 	file->nbytes = 0;
 	file->compress = false;
+    file->cBuffer = NULL;
 
 	return file;
 }
@@ -235,16 +239,45 @@ BufFileCreateTemp(bool interXact, bool compress)
 
 	if (temp_file_compression != TEMP_NONE_COMPRESSION)
 	{
-#ifdef USE_LZ4
 		file->compress = compress;
-#else
-		NO_LZ4_SUPPORT();
-#endif
 	}
 
 	return file;
-}
 
+}
+/*
+ * Wrapper for BuffileCreateTemp
+ * We want to limit the number of memory allocations for the compression buffer,
+ * only one buffer for all compression operations is enough
+ */
+BufFile *
+BufFileCreateCompressTemp(bool interXact){
+    static char * buff = NULL;
+    BufFile *tmpBufFile = BufFileCreateTemp(interXact, true);
+
+    if (buff == NULL && temp_file_compression != TEMP_NONE_COMPRESSION)
+    {
+        int size = 0;
+
+        switch (temp_file_compression)
+        {
+            case TEMP_LZ4_COMPRESSION:
+#ifdef USE_LZ4
+                size = LZ4_compressBound(BLCKSZ)+sizeof(int);
+#endif
+                break;
+            case TEMP_PGLZ_COMPRESSION:
+                size = pglz_maximum_compressed_size(BLCKSZ, BLCKSZ)+sizeof(int);
+                break;
+        }
+        /*
+         * Persistent buffer for all temporary file compressions
+         */
+        buff = MemoryContextAlloc(TopMemoryContext, size);
+    }
+    tmpBufFile->cBuffer = buff;
+    return tmpBufFile;
+}
 /*
  * Build the name for a given segment of a given BufFile.
  */
@@ -516,12 +549,10 @@ BufFileLoadBuffer(BufFile *file)
 		/* if not EOF let's continue */
 		if (nread > 0)
 		{
-			/*
-			 * A long life buffer would make sence to limit number of
-			 * memory allocations
-			 */
-			char * buff;
+			/* A long life buffer limits number of memory allocations */
+			char * buff = file->cBuffer;
 
+            Assert(file->cBuffer != NULL);
 			/*
 			 * Read compressed data, curOffset differs with pos
 			 * It reads less data than it returns to caller
@@ -529,25 +560,32 @@ BufFileLoadBuffer(BufFile *file)
 			 */
 			file->curOffset+=sizeof(nbytes);
 
-			buff = palloc(nbytes);
-
 			nread = FileRead(thisfile,
 							buff,
 							nbytes,
 							file->curOffset,
 							WAIT_EVENT_BUFFILE_READ);
 
+            switch (temp_file_compression)
+            {
+                case TEMP_LZ4_COMPRESSION:
 #ifdef USE_LZ4
-			file->nbytes = LZ4_decompress_safe(buff,
-				file->buffer.data,nbytes,sizeof(file->buffer));
-			file->curOffset += nread;
+			        file->nbytes = LZ4_decompress_safe(buff,
+				        file->buffer.data,nbytes,sizeof(file->buffer));
 #endif
+                    break;
+
+                case TEMP_PGLZ_COMPRESSION:
+                    file->nbytes = pglz_decompress(buff,nbytes,
+                            file->buffer.data,sizeof(file->buffer),false);
+                    break;
+            }
+			file->curOffset += nread;
 
 			if (file->nbytes < 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg_internal("compressed lz4 data is corrupt")));
-			pfree(buff);
 		}
 
 	}
@@ -591,8 +629,6 @@ BufFileDumpBuffer(BufFile *file)
 	/* Save nbytes value because the size changes due to compression */
 	int nbytesOriginal = file->nbytes;
 
-	bool compression = false;
-
 	char * DataToWrite;
 	DataToWrite = file->buffer.data;
 
@@ -604,26 +640,33 @@ BufFileDumpBuffer(BufFile *file)
 
 
 	if (file->compress) {
-		int cBufferSize = 0;
 		char * cData;
 		int cSize = 0;
+
+        Assert(file->cBuffer != NULL);
+		cData = file->cBuffer;
+
+        switch (temp_file_compression)
+            {
+            case TEMP_LZ4_COMPRESSION:
+                {
 #ifdef USE_LZ4
-		cBufferSize = LZ4_compressBound(file->nbytes);
+                int cBufferSize = LZ4_compressBound(file->nbytes);
+                /*
+                 * Using stream compression would lead to the slight improvement in
+                 * compression ratio
+                 */
+                cSize = LZ4_compress_default(file->buffer.data,
+                        cData + sizeof(int),file->nbytes, cBufferSize);
 #endif
-		/*
-		 * A long life buffer would make sence to limit number of
-		 * memory allocations
-		 */
-		compression = true;
-		cData = palloc(cBufferSize + sizeof(int));
-#ifdef USE_LZ4
-		/*
-		 * Using stream compression would lead to the slight improvement in
-		 * compression ratio
-		 */
-		cSize = LZ4_compress_default(file->buffer.data,
-				cData + sizeof(int),file->nbytes, cBufferSize);
-#endif
+                break;
+                }
+            case TEMP_PGLZ_COMPRESSION:
+                cSize = pglz_compress(file->buffer.data,file->nbytes,
+                        cData + sizeof(int),PGLZ_strategy_always);
+                break;
+            }
+
 
 		/* Write size of compressed block in front of compressed data
 		 * It's used to determine amount of data to read within
@@ -727,8 +770,6 @@ BufFileDumpBuffer(BufFile *file)
 	file->pos = 0;
 	file->nbytes = 0;
 
-	if (compression)
-		pfree(DataToWrite);
 }
 
 /*
