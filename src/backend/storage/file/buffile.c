@@ -108,6 +108,7 @@ struct BufFile
 	int			pos;			/* next read/write position in buffer */
 	int			nbytes;			/* total # of valid bytes in buffer */
 	bool			compress; /* State of usege file compression */
+    char        *cBuffer;
 	/*
 	 * XXX Should ideally us PGIOAlignedBlock, but might need a way to avoid
 	 * wasting per-file alignment padding when some users create many files.
@@ -140,6 +141,7 @@ makeBufFileCommon(int nfiles)
 	file->pos = 0;
 	file->nbytes = 0;
 	file->compress = false;
+    file->cBuffer = NULL;
 
 	return file;
 }
@@ -232,6 +234,7 @@ BufFileCreateTemp(bool interXact, bool compress)
 
 	file = makeBufFile(pfile);
 	file->isInterXact = interXact;
+    
 
 	if (temp_file_compression != TEMP_NONE_COMPRESSION)
 	{
@@ -244,7 +247,22 @@ BufFileCreateTemp(bool interXact, bool compress)
 
 	return file;
 }
+BufFile *
+BufFileCreateCompressTemp(bool interXact){
+    static char * buff = NULL;
+    BufFile *tmpBufFile = BufFileCreateTemp(interXact, true);
 
+    if (buff == NULL){
+        int size = 0;
+
+#ifdef USE_LZ4
+        size = LZ4_compressBound(BLCKSZ)+sizeof(int);
+#endif
+        buff = palloc(size);
+    }
+    tmpBufFile->cBuffer = buff;
+    return tmpBufFile;
+}
 /*
  * Build the name for a given segment of a given BufFile.
  */
@@ -520,7 +538,7 @@ BufFileLoadBuffer(BufFile *file)
 			 * A long life buffer would make sence to limit number of
 			 * memory allocations
 			 */
-			char * buff;
+			char * buff = file->cBuffer;
 
 			/*
 			 * Read compressed data, curOffset differs with pos
@@ -529,7 +547,7 @@ BufFileLoadBuffer(BufFile *file)
 			 */
 			file->curOffset+=sizeof(nbytes);
 
-			buff = palloc(nbytes);
+			//buff = palloc(nbytes);
 
 			nread = FileRead(thisfile,
 							buff,
@@ -547,7 +565,7 @@ BufFileLoadBuffer(BufFile *file)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg_internal("compressed lz4 data is corrupt")));
-			pfree(buff);
+			//pfree(buff);
 		}
 
 	}
@@ -615,7 +633,8 @@ BufFileDumpBuffer(BufFile *file)
 		 * memory allocations
 		 */
 		compression = true;
-		cData = palloc(cBufferSize + sizeof(int));
+		cData = file->cBuffer;
+        //cData = palloc(cBufferSize + sizeof(int));
 #ifdef USE_LZ4
 		/*
 		 * Using stream compression would lead to the slight improvement in
@@ -728,7 +747,8 @@ BufFileDumpBuffer(BufFile *file)
 	file->nbytes = 0;
 
 	if (compression)
-		pfree(DataToWrite);
+        ;
+		//pfree(DataToWrite);
 }
 
 /*

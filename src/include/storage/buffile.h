@@ -47,6 +47,7 @@ extern PGDLLIMPORT int temp_file_compression;
  * prototypes for functions in buffile.c
  */
 
+extern BufFile *BufFileCreateCompressTemp(bool interXact);
 extern BufFile *BufFileCreateTemp(bool interXact, bool compress);
 extern void BufFileClose(BufFile *file);
 extern pg_nodiscard size_t BufFileRead(BufFile *file, void *ptr, size_t size);
