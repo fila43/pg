@@ -35,6 +35,7 @@ typedef struct BufFile BufFile;
 typedef enum
 {
 	TEMP_NONE_COMPRESSION,
+	TEMP_PGLZ_COMPRESSION,
 #ifdef USE_LZ4
 	TEMP_LZ4_COMPRESSION
 #endif
