@@ -53,6 +53,7 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "utils/resowner.h"
+#include "utils/memutils.h"
 
 #ifdef USE_LZ4
 #include <lz4.h>
@@ -252,13 +253,17 @@ BufFileCreateCompressTemp(bool interXact){
     static char * buff = NULL;
     BufFile *tmpBufFile = BufFileCreateTemp(interXact, true);
 
-    if (buff == NULL){
+    if (buff == NULL ){
         int size = 0;
 
 #ifdef USE_LZ4
-        size = LZ4_compressBound(BLCKSZ)+sizeof(int);
+        size = LZ4_compressBound(BLCKSZ)+sizeof(int)+10000;
 #endif
-        buff = palloc(size);
+        /*
+         * We want to limit number of memory allocation for the buffer,
+         * one buffer for all compression is enough
+         */
+        buff = MemoryContextAlloc(TopMemoryContext, size);
     }
     tmpBufFile->cBuffer = buff;
     return tmpBufFile;
@@ -540,6 +545,7 @@ BufFileLoadBuffer(BufFile *file)
 			 */
 			char * buff = file->cBuffer;
 
+        Assert(file->cBuffer != NULL);
 			/*
 			 * Read compressed data, curOffset differs with pos
 			 * It reads less data than it returns to caller
@@ -633,6 +639,7 @@ BufFileDumpBuffer(BufFile *file)
 		 * memory allocations
 		 */
 		compression = true;
+        Assert(file->cBuffer != NULL);
 		cData = file->cBuffer;
         //cData = palloc(cBufferSize + sizeof(int));
 #ifdef USE_LZ4
